@@ -55,7 +55,8 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub embed_raw: bool,
 
-    /// Local fast temp directory (default: $TMPDIR/dngeat)
+    /// Local fast directory under which a unique per-process temp dir is
+    /// created (default: $TMPDIR)
     #[arg(long)]
     pub tmp_dir: Option<PathBuf>,
 
@@ -182,18 +183,21 @@ fn main() -> Result<()> {
         verify::libraw_version(),
     );
 
-    let tmp = args
-        .tmp_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("dngeat"));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)
-        .with_context(|| format!("cannot create temp dir {}", tmp.display()))?;
+    // Unique per-process temp dir (mkdtemp-style), so several dngeat
+    // instances can run in parallel without stomping on each other's staged
+    // files. Removed automatically on drop, including on error paths.
+    let tmp_parent = args.tmp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&tmp_parent)
+        .with_context(|| format!("cannot create temp dir {}", tmp_parent.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix("dngeat-")
+        .tempdir_in(&tmp_parent)
+        .with_context(|| format!("cannot create temp dir in {}", tmp_parent.display()))?;
 
     let ctx = Ctx {
         args: &args,
         network,
-        tmp: &tmp,
+        tmp: tmp.path(),
     };
 
     // ---- Phase 2: process, one file at a time ------------------------------
@@ -282,7 +286,7 @@ fn main() -> Result<()> {
     }
 
     bar.finish_and_clear();
-    let _ = std::fs::remove_dir_all(&tmp);
+    drop(tmp); // remove the per-process temp dir
 
     println!(
         "Done: {converted} converted, {resolved} resolved, {mismatched} mismatched, {failed} failed."
