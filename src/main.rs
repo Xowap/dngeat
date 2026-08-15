@@ -4,12 +4,13 @@ mod scan;
 mod verify;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
 
 use crate::pipeline::{Ctx, Outcome};
 use crate::scan::Kind;
@@ -196,12 +197,34 @@ fn main() -> Result<()> {
     };
 
     // ---- Phase 2: process, one file at a time ------------------------------
+    // ETA is computed per file, not per byte: indicatif's built-in `{eta}`
+    // watches the byte rate, but we only bump the bar once per file, so it
+    // stalls and jumps. Since files are roughly the same size, the average
+    // wall time per completed file times the number of remaining files is a
+    // much more honest estimate. Updated after each file, rendered through a
+    // custom template key.
+    let eta_secs = Arc::new(AtomicU64::new(u64::MAX));
+    let eta_key = {
+        let eta_secs = Arc::clone(&eta_secs);
+        move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| match eta_secs
+            .load(Ordering::Relaxed)
+        {
+            u64::MAX => {
+                let _ = write!(w, "-");
+            }
+            s => {
+                let _ = write!(w, "{}", FormattedDuration(Duration::from_secs(s)));
+            }
+        }
+    };
+
     let bar = ProgressBar::new(total_bytes);
     bar.set_style(
         ProgressStyle::with_template(
-            "{wide_bar} {binary_bytes}/{binary_total_bytes} eta {eta}\n{msg}",
+            "{wide_bar} {binary_bytes}/{binary_total_bytes} eta {file_eta}\n{msg}",
         )
         .unwrap()
+        .with_key("file_eta", eta_key)
         .progress_chars("=> "),
     );
     bar.enable_steady_tick(Duration::from_millis(250));
@@ -213,6 +236,7 @@ fn main() -> Result<()> {
     let mut saved: i64 = 0;
 
     let total = plan.items.len();
+    let started = Instant::now();
     for (i, item) in plan.items.iter().enumerate() {
         if stopping() {
             break;
@@ -248,6 +272,13 @@ fn main() -> Result<()> {
             }
         }
         bar.inc(item.size);
+
+        // Refresh the per-file ETA: average time per processed file times the
+        // number of files still in the queue.
+        let done = i + 1;
+        let remaining = total - done;
+        let avg = started.elapsed().as_secs_f64() / done as f64;
+        eta_secs.store((avg * remaining as f64).round() as u64, Ordering::Relaxed);
     }
 
     bar.finish_and_clear();
